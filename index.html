@@ -1748,17 +1748,18 @@
 
       <div class="section-title">Cloud Sync (Google Sheets)</div>
       <div class="card">
+        <div style="font-size:11.5px;color:var(--muted);margin-bottom:14px;line-height:1.6;">Your data now syncs automatically in the background — any change you make here shows up on your other signed-in devices within about a minute, with no buttons to press. Use the two below only if you want to force it right now.</div>
         <div class="setting-row">
           <div>
-            <div class="setting-label">Save to Google Sheet</div>
-            <div class="setting-sub">Pushes all your data to your private Google Sheet</div>
+            <div class="setting-label">Force Save to Cloud</div>
+            <div class="setting-sub">Push this device's data to the Sheet right now</div>
           </div>
-          <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" onclick="syncToCloud()">☁ Save to Cloud</button>
+          <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" onclick="syncToCloud(false)">☁ Save to Cloud</button>
         </div>
         <div class="setting-row">
           <div>
-            <div class="setting-label">Load from Google Sheet</div>
-            <div class="setting-sub">Replaces data on this device with your saved Sheet data</div>
+            <div class="setting-label">Force Load from Cloud</div>
+            <div class="setting-sub">Pull the Sheet's data onto this device right now</div>
           </div>
           <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" onclick="restoreFromCloud()">⬇ Load from Cloud</button>
         </div>
@@ -2350,6 +2351,7 @@ const APPS_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbzvosf66aXVHPT
 const ALLOWED_EMAIL    = "rajarshidutta123@gmail.com";
 
 let currentUserEmail = null;
+let suppressAutoSync = false; // true while we're writing cloud data INTO localStorage, so it doesn't immediately re-trigger a save back to the cloud
 
 function initGoogleSignIn() {
   if (typeof google === "undefined" || !google.accounts) {
@@ -2422,10 +2424,12 @@ function logoutPaisa() {
   }
 }
 
-function enterApp() {
+async function enterApp() {
   document.getElementById("loginScreen").style.display = "none";
   document.getElementById("appShell").style.display = "flex";
+  await autoLoadFromCloud();
   init();
+  startAutoSyncPolling();
 }
 
 initGoogleSignIn();
@@ -3228,6 +3232,20 @@ const BACKUP_KEYS = [
   'paisa_mf_v2', 'paisa_mf_txns_v1', 'paisa_daily_v1',
 ];
 
+// ── AUTO-SYNC WATCHER ──────────────────────────────────────────
+// Wraps localStorage.setItem so that ANY change the app makes to one of
+// the BACKUP_KEYS (adding a transaction, editing an asset, etc.) quietly
+// schedules a cloud save a couple of seconds later — no button needed.
+let autoSyncTimer = null;
+const _origSetItem = localStorage.setItem.bind(localStorage);
+localStorage.setItem = function (key, value) {
+  _origSetItem(key, value);
+  if (!suppressAutoSync && BACKUP_KEYS.indexOf(key) !== -1 && currentUserEmail) {
+    clearTimeout(autoSyncTimer);
+    autoSyncTimer = setTimeout(() => { syncToCloud(true); }, 2500);
+  }
+};
+
 function exportBackup() {
   const data = {};
   BACKUP_KEYS.forEach(k => {
@@ -3295,22 +3313,32 @@ async function importBackup(input) {
 //  CLOUD SYNC — Google Sheets via Apps Script
 //  Reuses the exact same BACKUP_KEYS shape as the local backup/restore
 //  above, so the same data can round-trip through a file or the cloud.
+//
+//  Three moving parts keep every device in sync automatically:
+//   1. The watcher above (near BACKUP_KEYS) auto-saves ~2.5s after any change.
+//   2. autoLoadFromCloud() runs once at sign-in, pulling in whatever the
+//      newest device last saved.
+//   3. startAutoSyncPolling() checks every 45s for changes made on OTHER
+//      devices while this tab stays open, and refreshes automatically.
 // ═══════════════════════════════════════════════
+const LAST_SYNCED_KEY = 'paisa_last_synced';
+
 function setCloudStatus(msg) {
   const el = document.getElementById('cloudSyncStatus');
   if (el) el.textContent = msg;
 }
 
-async function syncToCloud() {
-  if (!currentUserEmail) { showToast('❌ Not signed in'); return; }
+async function syncToCloud(silent) {
+  if (!currentUserEmail) { if (!silent) showToast('❌ Not signed in'); return; }
   const data = {};
   BACKUP_KEYS.forEach(k => {
     const v = localStorage.getItem(k);
     if (v !== null) data[k] = v;
   });
 
-  setCloudStatus('Saving…');
+  if (!silent) setCloudStatus('Saving…');
   try {
+    const nowIso = new Date().toISOString();
     const res = await fetch(APPS_SCRIPT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight on Apps Script
@@ -3319,16 +3347,17 @@ async function syncToCloud() {
         email: currentUserEmail,
         app: 'Paisa',
         version: '1.10',
-        savedAt: new Date().toISOString(),
+        savedAt: nowIso,
         data
       })
     });
     const json = await res.json();
-    if (json.error) { showToast('❌ ' + json.error); setCloudStatus('Last save failed.'); return; }
-    showToast('☁ Saved to Google Sheet');
-    setCloudStatus('Last saved: ' + new Date().toLocaleString());
+    if (json.error) { if (!silent) showToast('❌ ' + json.error); setCloudStatus('Last save failed.'); return; }
+    _origSetItem(LAST_SYNCED_KEY, nowIso); // bypass the watcher — this key isn't app data
+    if (!silent) showToast('☁ Saved to Google Sheet');
+    setCloudStatus((silent ? 'Auto-synced: ' : 'Last saved: ') + new Date().toLocaleString());
   } catch (err) {
-    showToast('❌ Network error — could not save to cloud');
+    if (!silent) showToast('❌ Network error — could not save to cloud');
     setCloudStatus('Last save failed.');
     console.error(err);
   }
@@ -3340,16 +3369,11 @@ async function restoreFromCloud() {
 
   setCloudStatus('Loading…');
   try {
-    const qs = 'action=load&email=' + encodeURIComponent(currentUserEmail);
-    const res = await fetch(APPS_SCRIPT_URL + '?' + qs);
-    const json = await res.json();
+    const json = await fetchCloudData_();
     if (json.error) { showToast('❌ ' + json.error); setCloudStatus('Load failed.'); return; }
     if (!json.data) { showToast('⚠️ No cloud backup found yet — use "Save to Cloud" first.'); setCloudStatus(''); return; }
 
-    const keysFound = BACKUP_KEYS.filter(k => json.data[k] !== undefined);
-    BACKUP_KEYS.forEach(k => localStorage.removeItem(k));
-    keysFound.forEach(k => localStorage.setItem(k, json.data[k]));
-
+    applyCloudData_(json);
     showToast('✅ Cloud data loaded — reloading…');
     setTimeout(() => location.reload(), 700);
   } catch (err) {
@@ -3357,6 +3381,66 @@ async function restoreFromCloud() {
     setCloudStatus('Load failed.');
     console.error(err);
   }
+}
+
+// Shared helper — fetches the raw {data, savedAt} blob for the signed-in user.
+async function fetchCloudData_() {
+  const qs = 'action=load&email=' + encodeURIComponent(currentUserEmail);
+  const res = await fetch(APPS_SCRIPT_URL + '?' + qs);
+  return res.json();
+}
+
+// Shared helper — writes a cloud blob into localStorage without re-triggering
+// the auto-save watcher (suppressAutoSync guards against that loop).
+function applyCloudData_(json) {
+  suppressAutoSync = true;
+  const keysFound = BACKUP_KEYS.filter(k => json.data[k] !== undefined);
+  BACKUP_KEYS.forEach(k => localStorage.removeItem(k));
+  keysFound.forEach(k => localStorage.setItem(k, json.data[k]));
+  if (json.savedAt) _origSetItem(LAST_SYNCED_KEY, new Date(json.savedAt).toISOString());
+  suppressAutoSync = false;
+}
+
+// Runs once, right after sign-in, before the app renders. Silent — the
+// person doesn't need to see this happen, it should just feel seamless.
+async function autoLoadFromCloud() {
+  if (!currentUserEmail) return;
+  try {
+    const json = await fetchCloudData_();
+    if (json.error || !json.data) return;
+
+    const cloudTime = json.savedAt ? new Date(json.savedAt).getTime() : 0;
+    const localTime = localStorage.getItem(LAST_SYNCED_KEY) ? new Date(localStorage.getItem(LAST_SYNCED_KEY)).getTime() : 0;
+
+    if (cloudTime > localTime) {
+      applyCloudData_(json);
+      setCloudStatus('Synced from cloud: ' + new Date(json.savedAt).toLocaleString());
+    }
+  } catch (err) {
+    console.error('Silent cloud load failed', err);
+  }
+}
+
+// Keeps this tab fresh if data changes on ANOTHER device while it's open.
+// Skips the check whenever a local edit is still waiting to be auto-saved,
+// so it never clobbers something you're in the middle of typing.
+function startAutoSyncPolling() {
+  setInterval(async () => {
+    if (!currentUserEmail || autoSyncTimer) return; // a local save is pending — don't pull over it
+    try {
+      const json = await fetchCloudData_();
+      if (json.error || !json.data) return;
+      const cloudTime = json.savedAt ? new Date(json.savedAt).getTime() : 0;
+      const localTime = localStorage.getItem(LAST_SYNCED_KEY) ? new Date(localStorage.getItem(LAST_SYNCED_KEY)).getTime() : 0;
+      if (cloudTime > localTime) {
+        showToast('☁ New data found from another device — refreshing…');
+        applyCloudData_(json);
+        setTimeout(() => location.reload(), 1200);
+      }
+    } catch (err) {
+      console.error('Background sync check failed', err);
+    }
+  }, 45000);
 }
 
 // ═══════════════════════════════════════════════
