@@ -3503,24 +3503,61 @@ const SOURCE_LABELS = { jitu: 'Jitu Sir', mom: 'Mom', others: 'Others' };
 //  ASSETS — NET WORTH CALC
 // ═══════════════════════════════════════════════
 function calcNetWorth() {
-  // Cash & Bank: stored amounts only — completely independent of transactions
   const cashAsset = assets.find(a => a.type === 'cash');
   const bankAsset = assets.find(a => a.type === 'bank') || assets.find(a => a.type === 'savings');
 
-  const cashEffective = cashAsset ? cashAsset.amount : 0;
-  const bankEffective = bankAsset ? bankAsset.amount : 0;
+  const cashBase     = cashAsset ? cashAsset.amount : 0;
+  const cashBaseDate = cashAsset ? cashAsset.date   : null;
+  const bankBase     = bankAsset ? bankAsset.amount : 0;
+  const bankBaseDate = bankAsset ? bankAsset.date   : null;
+
+  function txnDelta(account, afterDate) {
+    if (!afterDate) return 0;
+    return txns
+      .filter(t => t.account === account && t.date > afterDate)
+      .reduce((sum, t) => {
+        if (t.type === 'income')  return sum + t.amount;
+        if (t.type === 'expense') return sum - t.amount;
+        return sum;
+      }, 0);
+  }
+
+  function transferDelta(account, afterDate) {
+    if (!afterDate) return 0;
+    return transfers
+      .filter(tr => tr.to !== 'daily_savings' && tr.date > afterDate)
+      .reduce((sum, tr) => {
+        if (tr.to   === account) return sum + tr.amount;
+        if (tr.from === account) return sum - tr.amount;
+        return sum;
+      }, 0);
+  }
+
+  function dailyJarDeductions(account, afterDate) {
+    if (account !== 'bank' || !afterDate) return 0;
+    return transfers
+      .filter(tr => tr.to === 'daily_savings' && tr.date > afterDate)
+      .reduce((sum, tr) => sum + tr.amount, 0);
+  }
+
+  const cashEffective = cashBase
+    + txnDelta('cash', cashBaseDate)
+    + transferDelta('cash', cashBaseDate);
+
+  const bankEffective = bankBase
+    + txnDelta('bank', bankBaseDate)
+    + transferDelta('bank', bankBaseDate)
+    - dailyJarDeductions('bank', bankBaseDate);
 
   const dailySavingsJar = getDailySavingsTotal();
-
-  const pfTotal     = (pf.employee || 0) + (pf.employer || 0) + (pf.pension || 0);
-  const sharesTotal = assets.filter(a => a.type === 'shares').reduce((a,x) => a + x.amount, 0);
-  const mfTotal     = assets.filter(a => a.type === 'mf')    .reduce((a,x) => a + x.amount, 0);
-  const loanTotal   = assets.filter(a => a.type === 'loan')  .reduce((a,x) => a + x.amount, 0);
+  const pfTotal         = (pf.employee || 0) + (pf.employer || 0) + (pf.pension || 0);
+  const sharesTotal     = assets.filter(a => a.type === 'shares').reduce((a,x) => a + x.amount, 0);
+  const mfTotal         = assets.filter(a => a.type === 'mf')    .reduce((a,x) => a + x.amount, 0);
+  const loanTotal       = assets.filter(a => a.type === 'loan')  .reduce((a,x) => a + x.amount, 0);
 
   const port            = calcPortfolio();
-  const liquidTotal     = cashEffective + bankEffective;
   const investmentTotal = sharesTotal + mfTotal + port.sharesInvested + port.mfInvested;
-  const currentTotal    = liquidTotal + pfTotal + investmentTotal + dailySavingsJar;
+  const currentTotal    = cashEffective + bankEffective + pfTotal + investmentTotal + dailySavingsJar;
 
   const futurePending = futures
     .filter(f => f.status === 'pending' || f.status === 'partial')
@@ -3529,11 +3566,15 @@ function calcNetWorth() {
       return a + f.amount;
     }, 0);
 
-  const bankWithJar  = bankEffective; // jar already deducted from bank directly
-  const totalAssets  = pfTotal + investmentTotal + cashEffective + bankEffective + dailySavingsJar + futurePending;
-  const netWorth     = currentTotal + futurePending - loanTotal;
+  const totalAssets = pfTotal + investmentTotal + cashEffective + bankEffective + dailySavingsJar + futurePending;
+  const netWorth    = currentTotal + futurePending - loanTotal;
 
-  return { cashEffective, bankEffective, bankWithJar, liquidTotal, pfTotal, sharesTotal, mfTotal, investmentTotal, loanTotal, currentTotal, futurePending, totalAssets, netWorth, dailySavingsJar };
+  return { 
+    cashEffective, bankEffective, bankWithJar: bankEffective, 
+    liquidTotal: cashEffective + bankEffective, 
+    pfTotal, sharesTotal, mfTotal, investmentTotal, loanTotal, 
+    currentTotal, futurePending, totalAssets, netWorth, dailySavingsJar 
+  };
 }
 
 // ═══════════════════════════════════════════════
@@ -3931,10 +3972,15 @@ function saveAsset() {
     if (existing) { showToast(`⚠️ You already have a ${type === 'cash' ? 'Cash' : 'Bank'} asset. Tap it to edit.`); return; }
   }
 
-  if (id) {
+ if (id) {
     const idx = assets.findIndex(a => a.id === id);
-    if (idx > -1) assets[idx] = { ...assets[idx], type, name, amount, date, description: desc };
-  } else {
+    if (idx > -1) assets[idx] = { 
+        ...assets[idx], 
+        type, name, amount, 
+        date: new Date().toISOString().slice(0,10), // always stamp TODAY when editing
+        description: desc 
+    };
+} else {
     assets.push({ id: genId(), type, name, amount, date, description: desc, createdAt: Date.now() });
   }
   saveAssets(assets);
@@ -4068,11 +4114,8 @@ function saveTransfer() {
   // Directly update stored asset amounts (balances are independent of transactions)
   const cashAsset = assets.find(a => a.type === 'cash');
   const bankAsset = assets.find(a => a.type === 'bank') || assets.find(a => a.type === 'savings');
-  if (transferFrom === 'cash' && cashAsset) cashAsset.amount = Math.max(0, cashAsset.amount - amount);
-  if (transferFrom === 'bank' && bankAsset) bankAsset.amount = Math.max(0, bankAsset.amount - amount);
-  if (transferTo   === 'cash' && cashAsset) cashAsset.amount += amount;
-  if (transferTo   === 'bank' && bankAsset) bankAsset.amount += amount;
-  saveAssets(assets);
+ 
+  
 
   // Log for history
   transfers.push({ id: genId(), from: transferFrom, to: transferTo, amount, date, note, createdAt: Date.now() });
@@ -4905,10 +4948,9 @@ function checkDailySavings() {
     d.setDate(d.getDate() + i);
     const dateStr = d.toISOString().slice(0, 10);
     transfers.push({ id: genId(), from: 'bank', to: 'daily_savings', amount: 10, date: dateStr, note: 'Daily Savings Jar — auto', createdAt: Date.now() });
-    if (bankAsset) bankAsset.amount = Math.max(0, bankAsset.amount - 10);
   }
   saveTransfers(transfers);
-  if (bankAsset && diffDays > 0) saveAssets(assets);
+
 
   dailyCfg.lastDate = today;
   saveDaily(dailyCfg);
